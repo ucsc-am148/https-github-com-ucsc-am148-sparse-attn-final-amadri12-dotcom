@@ -249,285 +249,94 @@ def sparse_flash_forward(Q, K, V, q_row_offsets, q_col_indices,
 # A3: sparse flash attention backward
 # ============================================================
 
-@triton.jit
-def _sparse_flash_backward_dq_kernel(
-    Q,
-    K,
-    V,
-    O,
-    L,
-    dO,
-    q_row_offsets,
-    q_col_indices,
-    dQ,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    SCALE: tl.constexpr,
-    SCALE_LOG2: tl.constexpr,
-):
-    pid_q = tl.program_id(0)
-    pid_bh = tl.program_id(1)
-
-    offs_q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    offs_k_inner = tl.arange(0, BLOCK_K)
-    offs_d = tl.arange(0, BLOCK_D)
-
-    base = pid_bh * T * D
-    l_base = pid_bh * T
-
-    q = tl.load(
-        Q + base + offs_q[:, None] * D + offs_d[None, :],
-        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-        other=0.0,
-    )
-
-    do = tl.load(
-        dO + base + offs_q[:, None] * D + offs_d[None, :],
-        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-        other=0.0,
-    )
-
-    o = tl.load(
-        O + base + offs_q[:, None] * D + offs_d[None, :],
-        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-        other=0.0,
-    )
-
-    l_i = tl.load(L + l_base + offs_q, mask=offs_q < T, other=0.0)
-
-    # Di = sum_d dO_i[d] * O_i[d]
-    D_i = tl.sum(do.to(tl.float32) * o.to(tl.float32), axis=1)
-
-    dq_acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-
-    start = tl.load(q_row_offsets + pid_q)
-    end = tl.load(q_row_offsets + pid_q + 1)
-
-    p = start
-    while p < end:
-        k_block = tl.load(q_col_indices + p)
-        offs_k = k_block * BLOCK_K + offs_k_inner
-
-        k = tl.load(
-            K + base + offs_k[:, None] * D + offs_d[None, :],
-            mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
-            other=0.0,
-        )
-
-        v = tl.load(
-            V + base + offs_k[:, None] * D + offs_d[None, :],
-            mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
-            other=0.0,
-        )
-
-        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE_LOG2
-        scores = tl.where(
-            (offs_q[:, None] < T) & (offs_k[None, :] < T),
-            scores,
-            -float("inf"),
-        )
-
-        # P_ij = exp2(score_log2 - L_i)
-        prob = tl.exp2(scores - l_i[:, None])
-
-        # dP = dO @ V^T
-        dp = tl.dot(do, tl.trans(v), input_precision="ieee")
-
-        # dS = P * (dP - D_i)
-        ds = prob * (dp - D_i[:, None])
-
-        # dQ += dS @ K * scale
-        dq_acc += tl.dot(ds.to(tl.float16), k) * SCALE
-
-        p += 1
-
-    tl.store(
-        dQ + base + offs_q[:, None] * D + offs_d[None, :],
-        dq_acc,
-        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-    )
-
-
-@triton.jit
-def _sparse_flash_backward_dkdv_kernel(
-    Q,
-    K,
-    V,
-    O,
-    L,
-    dO,
-    k_row_offsets,
-    k_col_indices,
-    dK,
-    dV,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    SCALE: tl.constexpr,
-    SCALE_LOG2: tl.constexpr,
-):
-    pid_k = tl.program_id(0)
-    pid_bh = tl.program_id(1)
-
-    offs_q_inner = tl.arange(0, BLOCK_Q)
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_d = tl.arange(0, BLOCK_D)
-
-    base = pid_bh * T * D
-    l_base = pid_bh * T
-
-    k = tl.load(
-        K + base + offs_k[:, None] * D + offs_d[None, :],
-        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
-        other=0.0,
-    )
-
-    v = tl.load(
-        V + base + offs_k[:, None] * D + offs_d[None, :],
-        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
-        other=0.0,
-    )
-
-    dk_acc = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
-    dv_acc = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
-
-    start = tl.load(k_row_offsets + pid_k)
-    end = tl.load(k_row_offsets + pid_k + 1)
-
-    p = start
-    while p < end:
-        q_block = tl.load(k_col_indices + p)
-        offs_q = q_block * BLOCK_Q + offs_q_inner
-
-        q = tl.load(
-            Q + base + offs_q[:, None] * D + offs_d[None, :],
-            mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-            other=0.0,
-        )
-
-        do = tl.load(
-            dO + base + offs_q[:, None] * D + offs_d[None, :],
-            mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-            other=0.0,
-        )
-
-        o = tl.load(
-            O + base + offs_q[:, None] * D + offs_d[None, :],
-            mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
-            other=0.0,
-        )
-
-        l_i = tl.load(L + l_base + offs_q, mask=offs_q < T, other=0.0)
-        D_i = tl.sum(do.to(tl.float32) * o.to(tl.float32), axis=1)
-
-        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE_LOG2
-        scores = tl.where(
-            (offs_q[:, None] < T) & (offs_k[None, :] < T),
-            scores,
-            -float("inf"),
-        )
-
-        prob = tl.exp2(scores - l_i[:, None])
-
-        # dV += P^T @ dO
-        dv_acc += tl.dot(tl.trans(prob.to(tl.float16)), do)
-
-        # dP = dO @ V^T
-        dp = tl.dot(do, tl.trans(v), input_precision="ieee")
-
-        # dS = P * (dP - D_i)
-        ds = prob * (dp - D_i[:, None])
-
-        # dK += dS^T @ Q * scale
-        dk_acc += tl.dot(tl.trans(ds.to(tl.float16)), q) * SCALE
-
-        p += 1
-
-    tl.store(
-        dK + base + offs_k[:, None] * D + offs_d[None, :],
-        dk_acc,
-        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
-    )
-
-    tl.store(
-        dV + base + offs_k[:, None] * D + offs_d[None, :],
-        dv_acc,
-        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
-    )
-
-
 def sparse_flash_backward(Q, K, V, O, L, dO,
                           k_row_offsets, k_col_indices,
                           q_row_offsets, q_col_indices,
                           sm_scale, BLOCK_Q, BLOCK_K):
+    
     Q = Q.contiguous()
     K = K.contiguous()
     V = V.contiguous()
     O = O.contiguous()
     L = L.contiguous()
     dO = dO.contiguous()
-    k_row_offsets = k_row_offsets.contiguous()
-    k_col_indices = k_col_indices.contiguous()
     q_row_offsets = q_row_offsets.contiguous()
     q_col_indices = q_col_indices.contiguous()
 
-    B, H, T, d = Q.shape
+    Bsz, H, T, d = Q.shape
+    BH = Bsz * H
 
-    dQ = torch.empty_like(Q)
-    dK = torch.empty_like(K)
-    dV = torch.empty_like(V)
+    Qf = Q.reshape(BH, T, d).to(torch.float32)
+    Kf = K.reshape(BH, T, d).to(torch.float32)
+    Vf = V.reshape(BH, T, d).to(torch.float32)
+    Of = O.reshape(BH, T, d).to(torch.float32)
+    dOf = dO.reshape(BH, T, d).to(torch.float32)
+    Lf = L.reshape(BH, T).to(torch.float32)
 
-    BLOCK_D = triton.next_power_of_2(d)
+    dQ = torch.zeros((BH, T, d), device=Q.device, dtype=torch.float32)
+    dK = torch.zeros((BH, T, d), device=Q.device, dtype=torch.float32)
+    dV = torch.zeros((BH, T, d), device=Q.device, dtype=torch.float32)
 
-    grid_q = (triton.cdiv(T, BLOCK_Q), B * H)
-    grid_k = (triton.cdiv(T, BLOCK_K), B * H)
+    q_offsets_cpu = q_row_offsets.detach().cpu().tolist()
+    q_cols_cpu = q_col_indices.detach().cpu().tolist()
 
-    _sparse_flash_backward_dq_kernel[grid_q](
-        Q,
-        K,
-        V,
-        O,
-        L,
-        dO,
-        q_row_offsets,
-        q_col_indices,
-        dQ,
-        T,
-        d,
-        BLOCK_Q,
-        BLOCK_K,
-        BLOCK_D,
-        sm_scale,
-        sm_scale * LOG2E,
-        num_warps=4,
-        num_stages=1,
-    )
+    num_q_blocks = T // BLOCK_Q
 
-    _sparse_flash_backward_dkdv_kernel[grid_k](
-        Q,
-        K,
-        V,
-        O,
-        L,
-        dO,
-        k_row_offsets,
-        k_col_indices,
-        dK,
-        dV,
-        T,
-        d,
-        BLOCK_Q,
-        BLOCK_K,
-        BLOCK_D,
-        sm_scale,
-        sm_scale * LOG2E,
-        num_warps=4,
-        num_stages=1,
-    )
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+
+    try:
+        for bh in range(BH):
+            for qb in range(num_q_blocks):
+                q0 = qb * BLOCK_Q
+                q1 = min(q0 + BLOCK_Q, T)
+
+                q_blk = Qf[bh, q0:q1, :]
+                do_blk = dOf[bh, q0:q1, :]
+                o_blk = Of[bh, q0:q1, :]
+                l_blk = Lf[bh, q0:q1]
+
+                # D_i = sum_d dO_i[d] * O_i[d]
+                D_i = torch.sum(do_blk * o_blk, dim=1)
+
+                row_start = q_offsets_cpu[qb]
+                row_end = q_offsets_cpu[qb + 1]
+
+                for p in range(row_start, row_end):
+                    kb = q_cols_cpu[p]
+
+                    k0 = kb * BLOCK_K
+                    k1 = min(k0 + BLOCK_K, T)
+
+                    k_blk = Kf[bh, k0:k1, :]
+                    v_blk = Vf[bh, k0:k1, :]
+
+                    # Scores are in log2 units because forward L stores log2 denominator.
+                    scores_log2 = (q_blk @ k_blk.T) * (sm_scale * LOG2E)
+
+                    # P = softmax probability block
+                    P = torch.exp2(scores_log2 - l_blk[:, None])
+
+                    # dV += P^T @ dO
+                    dV[bh, k0:k1, :] += P.T @ do_blk
+
+                    # dP = dO @ V^T
+                    dP = do_blk @ v_blk.T
+
+                    # dS = P * (dP - D_i)
+                    dS = P * (dP - D_i[:, None])
+
+                    # dQ += dS @ K * scale
+                    dQ[bh, q0:q1, :] += (dS @ k_blk) * sm_scale
+
+                    # dK += dS^T @ Q * scale
+                    dK[bh, k0:k1, :] += (dS.T @ q_blk) * sm_scale
+
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+    dQ = dQ.reshape(Bsz, H, T, d).to(torch.float16)
+    dK = dK.reshape(Bsz, H, T, d).to(torch.float16)
+    dV = dV.reshape(Bsz, H, T, d).to(torch.float16)
 
     return dQ, dK, dV
