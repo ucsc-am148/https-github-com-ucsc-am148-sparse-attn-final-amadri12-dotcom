@@ -1,5 +1,6 @@
 """STUDENT FILE: implement the three block-sparse rung functions."""
 """Alejandro Madrigal"""
+
 import torch
 import triton
 import triton.language as tl
@@ -11,6 +12,24 @@ LOG2E = 1.4426950408889634
 # ============================================================
 # A1: block-sparse DSD matmul
 # ============================================================
+#
+# C = A @ B, where A is stored in BCSR block form.
+#
+# values[p] is one live dense block of A with shape (block, block).
+# row_offsets tells us which live blocks belong to each block-row.
+# column_indices[p] tells us the block-column of values[p].
+#
+# This kernel intentionally does NOT compute a whole block-row at once.
+# The old version tried BLOCK x BLOCK_N, which exploded shared memory
+# for block=128 and especially block=256 on a Tesla T4.
+#
+# Instead:
+#   - split the A block rows into small BM chunks
+#   - split the inner block dimension into BK chunks
+#   - compute C[block-row subchunk, N tile]
+#
+# This is slower than a fully optimized version, but it should clear
+# correctness and avoid the OutOfResources shared-memory failure.
 
 @triton.jit
 def _dsd_matmul_kernel(
@@ -23,39 +42,53 @@ def _dsd_matmul_kernel(
     K: tl.constexpr,
     N: tl.constexpr,
     BLOCK: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
-    pid_r = tl.program_id(1)
+    pid_block_row = tl.program_id(1)
+    pid_sub_m = tl.program_id(2)
 
-    offs_m = pid_r * BLOCK + tl.arange(0, BLOCK)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK)
+    offs_m_inner = pid_sub_m * BM + tl.arange(0, BM)
+    offs_m = pid_block_row * BLOCK + offs_m_inner
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k_inner = tl.arange(0, BK)
 
-    acc = tl.zeros((BLOCK, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
 
-    start = tl.load(row_offsets + pid_r)
-    end = tl.load(row_offsets + pid_r + 1)
+    start = tl.load(row_offsets + pid_block_row)
+    end = tl.load(row_offsets + pid_block_row + 1)
 
     p = start
     while p < end:
         k_block = tl.load(column_indices + p)
 
-        a = tl.load(
-            values + p * BLOCK * BLOCK
-            + tl.arange(0, BLOCK)[:, None] * BLOCK
-            + offs_k[None, :],
-            mask=True,
-            other=0.0,
-        )
+        k0 = 0
+        while k0 < BLOCK:
+            offs_k = k0 + offs_k_inner
 
-        b = tl.load(
-            Bmat + (k_block * BLOCK + offs_k[:, None]) * N + offs_n[None, :],
-            mask=offs_n[None, :] < N,
-            other=0.0,
-        )
+            a = tl.load(
+                values
+                + p * BLOCK * BLOCK
+                + offs_m_inner[:, None] * BLOCK
+                + offs_k[None, :],
+                mask=(offs_m_inner[:, None] < BLOCK) & (offs_k[None, :] < BLOCK),
+                other=0.0,
+            )
 
-        acc += tl.dot(a, b, input_precision="ieee")
+            b = tl.load(
+                Bmat
+                + (k_block * BLOCK + offs_k[:, None]) * N
+                + offs_n[None, :],
+                mask=((k_block * BLOCK + offs_k[:, None]) < K)
+                & (offs_n[None, :] < N),
+                other=0.0,
+            )
+
+            acc += tl.dot(a, b, input_precision="ieee")
+            k0 += BK
+
         p += 1
 
     tl.store(
@@ -73,8 +106,16 @@ def dsd_matmul(values, row_offsets, column_indices, B, M, K, N, block):
 
     C = torch.empty((M, N), device=B.device, dtype=torch.float32)
 
-    BLOCK_N = 32
-    grid = (triton.cdiv(N, BLOCK_N), M // block)
+    # Conservative tiles for T4 shared-memory limits.
+    BM = 16
+    BN = 32
+    BK = 32
+
+    grid = (
+        triton.cdiv(N, BN),
+        M // block,
+        triton.cdiv(block, BM),
+    )
 
     _dsd_matmul_kernel[grid](
         values,
@@ -86,8 +127,11 @@ def dsd_matmul(values, row_offsets, column_indices, B, M, K, N, block):
         K,
         N,
         block,
-        BLOCK_N,
+        BM,
+        BN,
+        BK,
         num_warps=4,
+        num_stages=1,
     )
 
     return C
@@ -218,6 +262,7 @@ def sparse_flash_forward(Q, K, V, q_row_offsets, q_col_indices,
         BLOCK_D,
         sm_scale * LOG2E,
         num_warps=4,
+        num_stages=1,
     )
 
     return O, L
@@ -275,6 +320,8 @@ def _sparse_flash_backward_dq_kernel(
     )
 
     l_i = tl.load(L + l_base + offs_q, mask=offs_q < T, other=0.0)
+
+    # Di = sum_d dO_i[d] * O_i[d]
     D_i = tl.sum(do.to(tl.float32) * o.to(tl.float32), axis=1)
 
     dq_acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
@@ -306,12 +353,18 @@ def _sparse_flash_backward_dq_kernel(
             -float("inf"),
         )
 
+        # P_ij = exp2(score_log2 - L_i)
         prob = tl.exp2(scores - l_i[:, None])
 
+        # dP = dO @ V^T
         dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+
+        # dS = P * (dP - D_i)
         ds = prob * (dp - D_i[:, None])
 
+        # dQ += dS @ K * scale
         dq_acc += tl.dot(ds.to(tl.float16), k) * SCALE
+
         p += 1
 
     tl.store(
@@ -404,12 +457,18 @@ def _sparse_flash_backward_dkdv_kernel(
 
         prob = tl.exp2(scores - l_i[:, None])
 
+        # dV += P^T @ dO
         dv_acc += tl.dot(tl.trans(prob.to(tl.float16)), do)
 
+        # dP = dO @ V^T
         dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+
+        # dS = P * (dP - D_i)
         ds = prob * (dp - D_i[:, None])
 
+        # dK += dS^T @ Q * scale
         dk_acc += tl.dot(tl.trans(ds.to(tl.float16)), q) * SCALE
+
         p += 1
 
     tl.store(
@@ -469,6 +528,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
         sm_scale,
         sm_scale * LOG2E,
         num_warps=4,
+        num_stages=1,
     )
 
     _sparse_flash_backward_dkdv_kernel[grid_k](
@@ -490,6 +550,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
         sm_scale,
         sm_scale * LOG2E,
         num_warps=4,
+        num_stages=1,
     )
 
     return dQ, dK, dV
