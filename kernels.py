@@ -1,89 +1,495 @@
-"""STUDENT FILE: implement the three block-sparse rung functions.
-
-Implement these three functions from the spec in ALGORITHMS.md -- no reference
-code is shipped:
-
-  dsd_matmul             (A1) block-sparse (BCSR) A @ dense B -> dense C
-  sparse_flash_forward   (A2) block-sparse flash attention forward
-  sparse_flash_backward  (A3) block-sparse flash attention backward
-
-Your functions must match the signatures below: the SHAPES and DTYPES of the
-inputs and outputs (each docstring states them; ALGORITHMS.md sec 0.1 collects
-them). EVERYTHING ELSE IS YOURS -- how many @triton.jit kernels you write, the
-grid, the (B, H) flatten, strides, output allocation, and the launch/tuning. The
-grader asserts the returned shapes and dtypes, then checks correctness against an
-fp64 reference.
-
-ALGORITHMS.md is the complete spec: the BCSR layout and its two transpose views,
-what each output equals, and the five backward equations.
-
-When `python sanity_check.py` passes all three rungs, you're done.
-"""
+"""STUDENT FILE: implement the three block-sparse rung functions."""
+"""Alejandro Madrigal"""
 import torch
 import triton
 import triton.language as tl
 
 
+LOG2E = 1.4426950408889634
+
+
+# ============================================================
+# A1: block-sparse DSD matmul
+# ============================================================
+
+@triton.jit
+def _dsd_matmul_kernel(
+    values,
+    row_offsets,
+    column_indices,
+    Bmat,
+    C,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_r = tl.program_id(1)
+
+    offs_m = pid_r * BLOCK + tl.arange(0, BLOCK)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK)
+
+    acc = tl.zeros((BLOCK, BLOCK_N), dtype=tl.float32)
+
+    start = tl.load(row_offsets + pid_r)
+    end = tl.load(row_offsets + pid_r + 1)
+
+    p = start
+    while p < end:
+        k_block = tl.load(column_indices + p)
+
+        a = tl.load(
+            values + p * BLOCK * BLOCK
+            + tl.arange(0, BLOCK)[:, None] * BLOCK
+            + offs_k[None, :],
+            mask=True,
+            other=0.0,
+        )
+
+        b = tl.load(
+            Bmat + (k_block * BLOCK + offs_k[:, None]) * N + offs_n[None, :],
+            mask=offs_n[None, :] < N,
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, input_precision="ieee")
+        p += 1
+
+    tl.store(
+        C + offs_m[:, None] * N + offs_n[None, :],
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
 def dsd_matmul(values, row_offsets, column_indices, B, M, K, N, block):
-    """A1 -- block-sparse C = A @ B. See ALGORITHMS.md sec 1-2.
+    values = values.contiguous()
+    row_offsets = row_offsets.contiguous()
+    column_indices = column_indices.contiguous()
+    B = B.contiguous()
 
-    Inputs:
-      values         (nnz, block, block)  fp32   A's live blocks, row-major
-      row_offsets    (M//block + 1,)      int32  per block-row prefix sum of nnz
-      column_indices (nnz,)               int32  K-block of each live block
-      B              (K, N)               fp32   dense right operand
-      M, K, N, block                      ints   dims and block size
-    Returns:
-      C              (M, N)               fp32
+    C = torch.empty((M, N), device=B.device, dtype=torch.float32)
 
-    fp32 throughout, allow_tf32=False.
+    BLOCK_N = 32
+    grid = (triton.cdiv(N, BLOCK_N), M // block)
 
-    TODO: implement.
-    """
-    raise NotImplementedError("TODO: implement dsd_matmul (A1)")
+    _dsd_matmul_kernel[grid](
+        values,
+        row_offsets,
+        column_indices,
+        B,
+        C,
+        M,
+        K,
+        N,
+        block,
+        BLOCK_N,
+        num_warps=4,
+    )
+
+    return C
+
+
+# ============================================================
+# A2: sparse flash attention forward
+# ============================================================
+
+@triton.jit
+def _sparse_flash_forward_kernel(
+    Q,
+    K,
+    V,
+    q_row_offsets,
+    q_col_indices,
+    O,
+    L,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SCALE_LOG2: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    offs_q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    offs_k_inner = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    base = pid_bh * T * D
+    l_base = pid_bh * T
+
+    q = tl.load(
+        Q + base + offs_q[:, None] * D + offs_d[None, :],
+        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+
+    m_i = tl.full((BLOCK_Q,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+
+    start = tl.load(q_row_offsets + pid_q)
+    end = tl.load(q_row_offsets + pid_q + 1)
+
+    p = start
+    while p < end:
+        k_block = tl.load(q_col_indices + p)
+        offs_k = k_block * BLOCK_K + offs_k_inner
+
+        k = tl.load(
+            K + base + offs_k[:, None] * D + offs_d[None, :],
+            mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        v = tl.load(
+            V + base + offs_k[:, None] * D + offs_d[None, :],
+            mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE_LOG2
+        scores = tl.where(
+            (offs_q[:, None] < T) & (offs_k[None, :] < T),
+            scores,
+            -float("inf"),
+        )
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        p_ij = tl.exp2(scores - m_new[:, None])
+
+        l_new = l_i * alpha + tl.sum(p_ij, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p_ij.to(tl.float16), v)
+
+        m_i = m_new
+        l_i = l_new
+        p += 1
+
+    out = acc / l_i[:, None]
+    l_out = m_i + tl.log2(l_i)
+
+    tl.store(
+        O + base + offs_q[:, None] * D + offs_d[None, :],
+        out,
+        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+    )
+
+    tl.store(
+        L + l_base + offs_q,
+        l_out,
+        mask=offs_q < T,
+    )
 
 
 def sparse_flash_forward(Q, K, V, q_row_offsets, q_col_indices,
                          sm_scale, BLOCK_Q, BLOCK_K):
-    """A2 -- block-sparse flash attention forward. See ALGORITHMS.md sec 1, 3.
+    Q = Q.contiguous()
+    K = K.contiguous()
+    V = V.contiguous()
+    q_row_offsets = q_row_offsets.contiguous()
+    q_col_indices = q_col_indices.contiguous()
 
-    Inputs:
-      Q, K, V        (B, H, T, d)         fp16
-      q_row_offsets  (T//block + 1,)      int32  query-block view: for query
-      q_col_indices  (nnz,)               int32  block i, its live key blocks j
-      sm_scale       float                       1/sqrt(d)
-      BLOCK_Q, BLOCK_K  ints                     == block (the mask granularity)
-    Returns:
-      O              (B, H, T, d)         fp16
-      L              (B, H, T)            fp32   log2 of the softmax denominator (sec 3)
+    B, H, T, d = Q.shape
 
-    See ALGORITHMS.md sec 3 for O and L.
+    O = torch.empty_like(Q)
+    L = torch.empty((B, H, T), device=Q.device, dtype=torch.float32)
 
-    TODO: implement.
-    """
-    raise NotImplementedError("TODO: implement sparse_flash_forward (A2)")
+    BLOCK_D = triton.next_power_of_2(d)
+    grid = (triton.cdiv(T, BLOCK_Q), B * H)
+
+    _sparse_flash_forward_kernel[grid](
+        Q,
+        K,
+        V,
+        q_row_offsets,
+        q_col_indices,
+        O,
+        L,
+        T,
+        d,
+        BLOCK_Q,
+        BLOCK_K,
+        BLOCK_D,
+        sm_scale * LOG2E,
+        num_warps=4,
+    )
+
+    return O, L
+
+
+# ============================================================
+# A3: sparse flash attention backward
+# ============================================================
+
+@triton.jit
+def _sparse_flash_backward_dq_kernel(
+    Q,
+    K,
+    V,
+    O,
+    L,
+    dO,
+    q_row_offsets,
+    q_col_indices,
+    dQ,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SCALE: tl.constexpr,
+    SCALE_LOG2: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    offs_q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    offs_k_inner = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    base = pid_bh * T * D
+    l_base = pid_bh * T
+
+    q = tl.load(
+        Q + base + offs_q[:, None] * D + offs_d[None, :],
+        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+
+    do = tl.load(
+        dO + base + offs_q[:, None] * D + offs_d[None, :],
+        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+
+    o = tl.load(
+        O + base + offs_q[:, None] * D + offs_d[None, :],
+        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+
+    l_i = tl.load(L + l_base + offs_q, mask=offs_q < T, other=0.0)
+    D_i = tl.sum(do.to(tl.float32) * o.to(tl.float32), axis=1)
+
+    dq_acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+
+    start = tl.load(q_row_offsets + pid_q)
+    end = tl.load(q_row_offsets + pid_q + 1)
+
+    p = start
+    while p < end:
+        k_block = tl.load(q_col_indices + p)
+        offs_k = k_block * BLOCK_K + offs_k_inner
+
+        k = tl.load(
+            K + base + offs_k[:, None] * D + offs_d[None, :],
+            mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        v = tl.load(
+            V + base + offs_k[:, None] * D + offs_d[None, :],
+            mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE_LOG2
+        scores = tl.where(
+            (offs_q[:, None] < T) & (offs_k[None, :] < T),
+            scores,
+            -float("inf"),
+        )
+
+        prob = tl.exp2(scores - l_i[:, None])
+
+        dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+        ds = prob * (dp - D_i[:, None])
+
+        dq_acc += tl.dot(ds.to(tl.float16), k) * SCALE
+        p += 1
+
+    tl.store(
+        dQ + base + offs_q[:, None] * D + offs_d[None, :],
+        dq_acc,
+        mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+    )
+
+
+@triton.jit
+def _sparse_flash_backward_dkdv_kernel(
+    Q,
+    K,
+    V,
+    O,
+    L,
+    dO,
+    k_row_offsets,
+    k_col_indices,
+    dK,
+    dV,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SCALE: tl.constexpr,
+    SCALE_LOG2: tl.constexpr,
+):
+    pid_k = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    offs_q_inner = tl.arange(0, BLOCK_Q)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    base = pid_bh * T * D
+    l_base = pid_bh * T
+
+    k = tl.load(
+        K + base + offs_k[:, None] * D + offs_d[None, :],
+        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+
+    v = tl.load(
+        V + base + offs_k[:, None] * D + offs_d[None, :],
+        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+
+    dk_acc = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
+    dv_acc = tl.zeros((BLOCK_K, BLOCK_D), dtype=tl.float32)
+
+    start = tl.load(k_row_offsets + pid_k)
+    end = tl.load(k_row_offsets + pid_k + 1)
+
+    p = start
+    while p < end:
+        q_block = tl.load(k_col_indices + p)
+        offs_q = q_block * BLOCK_Q + offs_q_inner
+
+        q = tl.load(
+            Q + base + offs_q[:, None] * D + offs_d[None, :],
+            mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        do = tl.load(
+            dO + base + offs_q[:, None] * D + offs_d[None, :],
+            mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        o = tl.load(
+            O + base + offs_q[:, None] * D + offs_d[None, :],
+            mask=(offs_q[:, None] < T) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        l_i = tl.load(L + l_base + offs_q, mask=offs_q < T, other=0.0)
+        D_i = tl.sum(do.to(tl.float32) * o.to(tl.float32), axis=1)
+
+        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * SCALE_LOG2
+        scores = tl.where(
+            (offs_q[:, None] < T) & (offs_k[None, :] < T),
+            scores,
+            -float("inf"),
+        )
+
+        prob = tl.exp2(scores - l_i[:, None])
+
+        dv_acc += tl.dot(tl.trans(prob.to(tl.float16)), do)
+
+        dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+        ds = prob * (dp - D_i[:, None])
+
+        dk_acc += tl.dot(tl.trans(ds.to(tl.float16)), q) * SCALE
+        p += 1
+
+    tl.store(
+        dK + base + offs_k[:, None] * D + offs_d[None, :],
+        dk_acc,
+        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+    )
+
+    tl.store(
+        dV + base + offs_k[:, None] * D + offs_d[None, :],
+        dv_acc,
+        mask=(offs_k[:, None] < T) & (offs_d[None, :] < D),
+    )
 
 
 def sparse_flash_backward(Q, K, V, O, L, dO,
-                          k_row_offsets, k_col_indices,   # key-block view (sec 1)
-                          q_row_offsets, q_col_indices,   # query-block view (sec 1)
+                          k_row_offsets, k_col_indices,
+                          q_row_offsets, q_col_indices,
                           sm_scale, BLOCK_Q, BLOCK_K):
-    """A3 -- block-sparse flash attention backward. See ALGORITHMS.md sec 1, 4.
+    Q = Q.contiguous()
+    K = K.contiguous()
+    V = V.contiguous()
+    O = O.contiguous()
+    L = L.contiguous()
+    dO = dO.contiguous()
+    k_row_offsets = k_row_offsets.contiguous()
+    k_col_indices = k_col_indices.contiguous()
+    q_row_offsets = q_row_offsets.contiguous()
+    q_col_indices = q_col_indices.contiguous()
 
-    Inputs:
-      Q, K, V, O, dO (B, H, T, d)         fp16   O, dO are the forward output and its grad
-      L              (B, H, T)            fp32   the forward residual
-      k_row_offsets  (T//block + 1,)      int32  key-block view: for key block j,
-      k_col_indices  (nnz,)               int32  the query blocks i that attend it
-      q_row_offsets  (T//block + 1,)      int32  query-block view: for query block i,
-      q_col_indices  (nnz,)               int32  its key blocks j (same as forward)
-      sm_scale       float
-      BLOCK_Q, BLOCK_K  ints                     == block
-    Returns:
-      dQ, dK, dV     (B, H, T, d)         fp16
+    B, H, T, d = Q.shape
 
-    See ALGORITHMS.md sec 4 for the five gradient equations.
+    dQ = torch.empty_like(Q)
+    dK = torch.empty_like(K)
+    dV = torch.empty_like(V)
 
-    TODO: implement.
-    """
-    raise NotImplementedError("TODO: implement sparse_flash_backward (A3)")
+    BLOCK_D = triton.next_power_of_2(d)
+
+    grid_q = (triton.cdiv(T, BLOCK_Q), B * H)
+    grid_k = (triton.cdiv(T, BLOCK_K), B * H)
+
+    _sparse_flash_backward_dq_kernel[grid_q](
+        Q,
+        K,
+        V,
+        O,
+        L,
+        dO,
+        q_row_offsets,
+        q_col_indices,
+        dQ,
+        T,
+        d,
+        BLOCK_Q,
+        BLOCK_K,
+        BLOCK_D,
+        sm_scale,
+        sm_scale * LOG2E,
+        num_warps=4,
+    )
+
+    _sparse_flash_backward_dkdv_kernel[grid_k](
+        Q,
+        K,
+        V,
+        O,
+        L,
+        dO,
+        k_row_offsets,
+        k_col_indices,
+        dK,
+        dV,
+        T,
+        d,
+        BLOCK_Q,
+        BLOCK_K,
+        BLOCK_D,
+        sm_scale,
+        sm_scale * LOG2E,
+        num_warps=4,
+    )
+
+    return dQ, dK, dV
