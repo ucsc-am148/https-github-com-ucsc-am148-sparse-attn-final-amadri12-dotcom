@@ -8,29 +8,6 @@ import triton.language as tl
 
 LOG2E = 1.4426950408889634
 
-
-# ============================================================
-# A1: block-sparse DSD matmul
-# ============================================================
-#
-# C = A @ B, where A is stored in BCSR block form.
-#
-# values[p] is one live dense block of A with shape (block, block).
-# row_offsets tells us which live blocks belong to each block-row.
-# column_indices[p] tells us the block-column of values[p].
-#
-# This kernel intentionally does NOT compute a whole block-row at once.
-# The old version tried BLOCK x BLOCK_N, which exploded shared memory
-# for block=128 and especially block=256 on a Tesla T4.
-#
-# Instead:
-#   - split the A block rows into small BM chunks
-#   - split the inner block dimension into BK chunks
-#   - compute C[block-row subchunk, N tile]
-#
-# This is slower than a fully optimized version, but it should clear
-# correctness and avoid the OutOfResources shared-memory failure.
-
 @triton.jit
 def _dsd_matmul_kernel(
     values,
